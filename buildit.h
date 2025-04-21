@@ -42,17 +42,8 @@
 #    include <direct.h>
 #    include <shellapi.h>
 #else // BT_WINDOWS
-#    ifndef _POSIX_C_SOURCE
-#    define _POSIX_C_SOURCE 200809L
-#    endif // _POSIX_C_SOURCE
 #    include <sys/types.h>
 #    include <sys/wait.h>
-#    ifndef __USE_XOPEN
-#        define __USE_XOPEN
-#    endif // __USE_XOPEN
-#    ifndef _XOPEN_SOURCE
-#        define _XOPEN_SOURCE
-#    endif // _XOPEN_SOURCE
 #    include <sys/stat.h>
 #    include <unistd.h>
 #    include <fcntl.h>
@@ -1937,7 +1928,7 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
         {
             if (jim->error == JIM_OK) {
                 if (jim->write(buffer, 1, size, jim->sink) < size) {
-                    jim->error = 1;
+                    jim->error = JIM_WRITE_ERROR;
                 }
             }
         }
@@ -3240,6 +3231,45 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
     int bt_process_read_output(Bt_Process* process, void* buffer, size_t buffer_size) {
         return subprocess_read_stdout((struct subprocess_s*)process, buffer, buffer_size);
     }
+    
+    void bt__delete_n_lines(int n) {
+        if (n <= 0) return;
+    
+        #ifdef _WIN32
+            // Windows implementation
+            HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (hStdout == INVALID_HANDLE_VALUE) {
+                fprintf(stderr, "Error getting handle to stdout\n");
+                return;
+            }
+        
+            CONSOLE_SCREEN_BUFFER_INFO csbi;
+            if (!GetConsoleScreenBufferInfo(hStdout, &csbi)) {
+                fprintf(stderr, "Error getting console screen buffer info\n");
+                return;
+            }
+        
+            COORD cursorPosition = csbi.dwCursorPosition;
+            cursorPosition.Y -= n;
+            if (cursorPosition.Y < 0) cursorPosition.Y = 0;
+        
+            if (!SetConsoleCursorPosition(hStdout, cursorPosition)) {
+                fprintf(stderr, "Error setting cursor position\n");
+                return;
+            }
+        
+            // Clear lines by overwriting with spaces
+            DWORD written;
+            FillConsoleOutputCharacter(hStdout, ' ', csbi.dwSize.X * n, cursorPosition, &written);
+            FillConsoleOutputAttribute(hStdout, csbi.wAttributes, csbi.dwSize.X * n, cursorPosition, &written);
+        #else
+            // Linux/Unix implementation using ANSI escape codes
+            for (int i = 0; i < n; i++) {
+                printf("\033[1A"); // Move cursor up one line
+                printf("\033[K");  // Clear the line
+            }
+        #endif
+    }
 
     bool bt_execute_command_queue(Bt_Cmds* command_queue, size_t command_queue_size, size_t max_active_processes) {
         size_t command_count = 0;
@@ -3301,12 +3331,9 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
                                 }
                             }
 
-                            size_t k;
-                            for (k = 0; k < lines_to_clear; k++) {
-                                // move cursor up and delete line
-                                printf("\x1b[1A\x1b[2K");
-                            }
+                            bt__delete_n_lines(lines_to_clear);
                             const char* line;
+                            size_t k;
                             bt_da_foreach(k, line, &permenant_lines_to_add) {
                                 printf("%s", line);
                             }
@@ -3350,9 +3377,7 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
 
                 if (needs_to_update_terminal) {
                     size_t k;
-                    for (k = 0; k < lines_to_clear; k++) {
-                        printf("\x1b[1A\x1b[2K");
-                    }
+                    bt__delete_n_lines(lines_to_clear);
                     const char* line;
                     bt_da_foreach(k, line, &permenant_lines_to_add) {
                         printf("%s", line);
@@ -3388,6 +3413,7 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
         }
 
         free(reading_buffer);
+        fflush(stdout);
 
         return true;
     }
@@ -4724,11 +4750,11 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
         void bt_slib_add_precompiled_header(Bt_Static_Library* slib, const char* precompiled_header) {
             bt_da_append(&slib->precompiled_headers, precompiled_header);
         }
-
+        
         void bt_slib_add_extra_build_flag(Bt_Static_Library* slib, const char* extra_build_flag) {
             bt_da_append(&slib->extra_build_flags, extra_build_flag);
         }
-
+        
         void bt_slib_add_define(Bt_Static_Library* slib, const char* define_name, const char* define_value) {
             Bt_Define define;
             define.name = define_name;
@@ -5041,10 +5067,16 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
         }
 
         bool bt_source_file_needs_rebuild(const char* filename, Bt_String_Array include_directories, Bt_Cmd compile_command) {
-            if (bt_was_file_modified(filename)) return true;
+            if (bt_was_file_modified(filename)) {
+                bt_compile_commands_update_entry(filename, compile_command);
+                return true;
+            }
 
             char* object_filename = bt_compiler_source_file_to_object_filename(bt_get_build_directory(), filename);
-            if (!bt_path_exists(object_filename)) return true;
+            if (!bt_path_exists(object_filename)) {
+                bt_compile_commands_update_entry(filename, compile_command);
+                return true;
+            }
             
             if (!bt_compile_commands_is_eq(filename, compile_command)) {
                 bt_compile_commands_update_entry(filename, compile_command);
@@ -5467,6 +5499,8 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
         // stage 4: linking executables
         Bt_Cmds commands_to_execute[5] = {{0}, {0}, {0}, {0}, {0}};
 
+        Bt_String_Array libs_that_will_be_rebuilt = {0};
+        
         size_t i;
         Bt_Static_Library* slib;
         bt_da_foreach_ref(i, slib, &spec->static_libraries) {
@@ -5567,6 +5601,8 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
             }
 
             if (need_to_relink_slib || !bt_path_exists(bt_compiler_get_static_library_name(slib->name, slib->output_location))) {
+                bt_da_append(&libs_that_will_be_rebuilt, slib->name);
+                
                 Bt_Cmd link_command = {0};
                 bt_compiler_generate_static_library(&link_command, &object_files, slib->output_location, slib->name);
 
@@ -5673,7 +5709,6 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
                 if (bt_source_file_needs_rebuild(source_file, include_paths_to_search, compile_command)) {
                     compile_command.message = bt_arena_sprintf("compiling %s", source_file);
                     compile_command.fail_message = bt_arena_sprintf("failed to compile %s", source_file);
-
                     bt_da_append(&commands_to_execute[1], compile_command);
                     need_to_relink_executable = true;
                 } else {
@@ -5684,7 +5719,32 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
             bt_da_free(&cxx_command);
             bt_da_free(&include_paths_to_search);
 
-            if (need_to_relink_executable) {
+            const char* final_exe_name = bt_concat_paths(executable->output_location, bt_arena_sprintf("%s%s", executable->name, bt_compiler_get_executable_extension()));
+            
+            bool was_a_dependency_modified = false;
+            
+            Bt_Static_Libraries expanded_libraries = {0};
+            if (!bt_expand_static_libraries_from_strings(executable->dependencies, spec->static_libraries, &expanded_libraries)) {
+                bt_log(BT_ERROR, "error found in the dependencies while processing `%s` executable", executable->name);
+                return false;
+            }
+
+            Bt_Static_Libraries sorted_libraries = {0};
+            if (!bt_sort_static_libraries(expanded_libraries.items, expanded_libraries.size, &sorted_libraries)) {
+                bt_log(BT_ERROR, "error found in the dependencies while processing %s executable", executable->name);
+                return false;
+            }
+            
+            for (size_t i = 0; i < sorted_libraries.size; i++) {
+                for (size_t j = 0; j < libs_that_will_be_rebuilt.size; j++) {
+                    if (strcmp(sorted_libraries.items[i].name, libs_that_will_be_rebuilt.items[j]) == 0) {
+                        was_a_dependency_modified = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (need_to_relink_executable || !bt_path_exists(final_exe_name) || was_a_dependency_modified) {
                 Bt_Cmd link_command = {0};
                 bt_da_extend(&link_command, bt_compiler_get_base_linker_command());
                 bt_compiler_add_files_to_linker(&link_command, &object_files);
@@ -5692,18 +5752,6 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
                 bt_compiler_add_libraries(&link_command, &executable->libraries);
                 bt_compiler_add_library_directories(&link_command, &spec->library_directories);
                 bt_compiler_add_libraries(&link_command, &spec->libraries);
-
-                Bt_Static_Libraries expanded_libraries = {0};
-                if (!bt_expand_static_libraries_from_strings(executable->dependencies, spec->static_libraries, &expanded_libraries)) {
-                    bt_log(BT_ERROR, "error found in the dependencies while processing `%s` executable", executable->name);
-                    return false;
-                }
-
-                Bt_Static_Libraries sorted_libraries = {0};
-                if (!bt_sort_static_libraries(expanded_libraries.items, expanded_libraries.size, &sorted_libraries)) {
-                    bt_log(BT_ERROR, "error found in the dependencies while processing %s executable", executable->name);
-                    return false;
-                }
                 for (size_t k = 0; k < sorted_libraries.size; k++) {
                     bt_compiler_add_library(&link_command, sorted_libraries.items[k].name);
                     bt_compiler_add_library_directory(&link_command, sorted_libraries.items[k].output_location);
@@ -5774,7 +5822,8 @@ bool bt_was_file_modified_from_includes(const char* target_filepath, Bt_String_A
         char* temp_exe = strdup(bt_concat_paths(output_location, bt_arena_strcat(temp_executable_name, bt_compiler_get_executable_extension())));
         
         bt_shutdown();
-
+        bt_sleep(50);
+        
         #ifdef _WIN32
             if (!MoveFileEx(temp_exe, final_executable_ext, MOVEFILE_REPLACE_EXISTING)) {
                 bt_log(BT_ERROR, "could not rename %s to %s: %s", temp_exe, final_executable_ext, bt_win32_error_message(GetLastError()));
